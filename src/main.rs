@@ -1,6 +1,7 @@
 #![deny(clippy::all)]
 
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::{collections::HashSet, fmt};
@@ -55,6 +56,7 @@ type Links = HashSet<Link>;
 struct Db {
     nodes: Nodes,
     links: Links,
+    host_names: HashSet<String>,
 }
 
 const MAX_DEPTH: i32 = 10;
@@ -73,19 +75,26 @@ impl std::error::Error for CrawlerError {}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let url = "https://www.rust-lang.org/";
+    let url = "https://rust-lang.org/";
     let selector = scraper::Selector::parse("a:not([href^=\"#\"])").unwrap();
 
     let mut db = Db {
         nodes: Nodes::new(),
         links: Links::new(),
+        host_names: HashSet::new(),
     };
     db.nodes.insert(Node {
         url: url.to_string(),
         group: 0,
     });
 
-    match crawl(Url::parse(url).unwrap(), &selector, &mut db, 0, 1).await {
+    // match crawl_dfs(Url::parse(url).unwrap(), &selector, &mut db, 0, 1).await {
+    //     Ok(_) => {}
+    //     Err(e) => {
+    //         println!("Error: {}", e);
+    //     }
+    // }
+    match crawl_bfs(Url::parse(url).unwrap(), &selector, &mut db).await {
         Ok(_) => {}
         Err(e) => {
             println!("Error: {}", e);
@@ -102,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[async_recursion::async_recursion(?Send)]
-async fn crawl(
+async fn crawl_dfs(
     url: Url,
     selector: &scraper::Selector,
     db: &mut Db,
@@ -156,6 +165,8 @@ async fn crawl(
             continue;
         } else {
             db.nodes.insert(node);
+            db.host_names
+                .insert(next_url.host_str().unwrap().to_string());
         }
 
         if depth >= MAX_DEPTH {
@@ -163,18 +174,86 @@ async fn crawl(
         }
 
         if raw_url.starts_with("/") {
-            match crawl(next_url, selector, db, depth + 1, group_num).await {
+            match crawl_dfs(next_url, selector, db, depth + 1, group_num).await {
                 Ok(_) => {}
                 Err(e) => {
                     return Err(e);
                 }
             }
         } else {
-            match crawl(next_url, selector, db, depth + 1, group_num + 1).await {
+            match crawl_dfs(next_url, selector, db, depth + 1, group_num + 1).await {
                 Ok(_) => {}
                 Err(e) => {
                     return Err(e);
                 }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[async_recursion::async_recursion(?Send)]
+async fn crawl_bfs(
+    start_url: Url,
+    selector: &scraper::Selector,
+    db: &mut Db,
+) -> Result<(), CrawlerError> {
+    let mut queue = VecDeque::new();
+    queue.push_back((start_url, 0, 0)); // (url, depth, group_num)
+
+    while let Some((url, depth, group_num)) = queue.pop_front() {
+        if db.nodes.len() >= MAX_NODES as usize {
+            return Ok(());
+        }
+
+        let webpage = reqwest::get(url.as_str()).await.unwrap();
+        let text = webpage.text().await.unwrap_or(String::from(""));
+
+        let doc = scraper::Html::parse_document(&text);
+
+        for el in doc.select(selector) {
+            if db.nodes.len() >= MAX_NODES as usize {
+                return Ok(());
+            }
+            let raw_url = match el.value().attr("href") {
+                Some(u) => u,
+                None => {
+                    println!("No href found {:?}\n", el.value());
+                    continue;
+                }
+            };
+            let next_url = url.join(raw_url).unwrap();
+            let node = Node {
+                url: next_url.to_string(),
+                group: group_num,
+            };
+            let link = Link {
+                source: url.to_string(),
+                target: next_url.to_string(),
+            };
+
+            if db.links.contains(&link) {
+                continue;
+            }
+
+            db.links.insert(link);
+            if db.nodes.contains(&node) {
+                continue;
+            } else {
+                db.nodes.insert(node);
+                db.host_names
+                    .insert(next_url.host_str().unwrap_or("").to_string());
+            }
+
+            if depth >= MAX_DEPTH {
+                continue;
+            }
+
+            if raw_url.starts_with("/") {
+                queue.push_back((next_url, depth + 1, group_num));
+            } else {
+                queue.push_back((next_url, depth + 1, group_num + 1));
             }
         }
     }
