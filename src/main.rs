@@ -1,32 +1,64 @@
 #![deny(clippy::all)]
 
+use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::{collections::HashSet, fmt};
+use url::Url;
 
-#[derive(Debug, Hash, Eq, PartialEq)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Node {
-    id: String,
+    url: String,
     group: i32,
+}
+
+impl Eq for Node {}
+
+impl PartialEq for Node {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url
+    }
+}
+
+impl Hash for Node {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.url.hash(state);
+    }
 }
 
 type Nodes = HashSet<Node>;
 
-#[derive(Debug, Hash, Eq, PartialEq)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Link {
     source: String,
     target: String,
-    value: i32,
+}
+
+impl Eq for Link {}
+
+impl PartialEq for Link {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source && self.target == other.target
+    }
+}
+
+impl Hash for Link {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.source.hash(state);
+        self.target.hash(state);
+    }
 }
 
 type Links = HashSet<Link>;
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Db {
     nodes: Nodes,
     links: Links,
 }
 
 const MAX_DEPTH: i32 = 10;
-const SELECTOR: scraper::Selector = scraper::Selector::parse("a:not([href^=\"#\"])").unwrap();
+const MAX_NODES: i32 = 1000;
 
 #[derive(Debug)]
 struct CrawlerError(reqwest::Error);
@@ -40,34 +72,44 @@ impl fmt::Display for CrawlerError {
 impl std::error::Error for CrawlerError {}
 
 #[tokio::main]
-async fn main() {
-    // let selector = scraper::Selector::parse("a:not([href^=\"#\"])").unwrap();
-    // let webpage = reqwest::get("https://github.com").await?.text().await?;
-    // let doc = scraper::Html::parse_document(&webpage);
-
-    // for el in doc.select(&selector) {
-    //     let text = el.text().collect::<Vec<_>>();
-    //     let link = el.value().attr("href").unwrap();
-    //     println!("{} ({})", text[0], link);
-    // }
-    // println!("{}", doc.select(&selector).count());
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let url = "https://www.rust-lang.org/";
+    let selector = scraper::Selector::parse("a:not([href^=\"#\"])").unwrap();
 
     let mut db = Db {
         nodes: Nodes::new(),
         links: Links::new(),
     };
+    db.nodes.insert(Node {
+        url: url.to_string(),
+        group: 0,
+    });
 
-    match crawl("https://github.com", &mut db, 0, 1).await {
+    match crawl(Url::parse(url).unwrap(), &selector, &mut db, 0, 1).await {
         Ok(_) => {}
         Err(e) => {
             println!("Error: {}", e);
         }
     }
+
+    println!("nodes count: {}", db.nodes.len());
+    println!("links count: {}", db.links.len());
+
+    let mut fp = std::fs::File::create("V:\\Projects\\Web-Crawler\\13f816d9685cdef3\\data.json")?;
+    write!(fp, "{}", serde_json::to_string(&db)?);
+
+    Ok(())
 }
 
 #[async_recursion::async_recursion(?Send)]
-async fn crawl(url: &str, db: &mut Db, depth: i32, group_num: i32) -> Result<(), CrawlerError> {
-    let webpage = match reqwest::get(url).await {
+async fn crawl(
+    url: Url,
+    selector: &scraper::Selector,
+    db: &mut Db,
+    depth: i32,
+    group_num: i32,
+) -> Result<(), CrawlerError> {
+    let webpage = match reqwest::get(url.as_str()).await {
         Ok(w) => w,
         Err(e) => {
             return Err(CrawlerError(e));
@@ -82,24 +124,35 @@ async fn crawl(url: &str, db: &mut Db, depth: i32, group_num: i32) -> Result<(),
 
     let doc = scraper::Html::parse_document(&text);
 
-    for el in doc.select(&SELECTOR) {
-        let next_url = el.value().attr("href").unwrap();
+    for el in doc.select(selector) {
+        if db.nodes.len() >= MAX_NODES as usize {
+            return Ok(());
+        }
+
+        let raw_url = match el.value().attr("href") {
+            Some(u) => u,
+            None => {
+                println!("No href found {:?}\n", el.value());
+                continue;
+            }
+        };
+        // println!("{}", raw_url);
+        let next_url = url.join(raw_url).unwrap();
         let node = Node {
-            id: next_url.to_string(),
+            url: next_url.to_string(),
             group: group_num,
         };
         let link = Link {
             source: url.to_string(),
             target: next_url.to_string(),
-            value: 1,
         };
 
         if db.links.contains(&link) {
             continue;
         }
 
+        db.links.insert(link);
         if db.nodes.contains(&node) {
-            db.links.insert(link);
             continue;
         } else {
             db.nodes.insert(node);
@@ -109,17 +162,19 @@ async fn crawl(url: &str, db: &mut Db, depth: i32, group_num: i32) -> Result<(),
             continue;
         }
 
-        let mut _grp_num: i32;
-        if !next_url.starts_with("/") {
-            _grp_num = group_num + 1;
+        if raw_url.starts_with("/") {
+            match crawl(next_url, selector, db, depth + 1, group_num).await {
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(e);
+                }
+            }
         } else {
-            _grp_num = group_num;
-        }
-
-        match crawl(next_url, db, depth + 1, _grp_num).await {
-            Ok(_) => {}
-            Err(e) => {
-                return Err(e);
+            match crawl(next_url, selector, db, depth + 1, group_num + 1).await {
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(e);
+                }
             }
         }
     }
