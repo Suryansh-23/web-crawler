@@ -1,7 +1,7 @@
 #![deny(clippy::all)]
 
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::{collections::HashSet, fmt};
@@ -10,6 +10,7 @@ use url::Url;
 #[derive(Debug, Serialize, Deserialize)]
 struct Node {
     url: String,
+    // outgoing: i32,
     group: i32,
 }
 
@@ -57,9 +58,12 @@ struct Db {
     nodes: Nodes,
     links: Links,
     host_names: HashSet<String>,
+    freq_table: HashMap<String, i32>,
 }
 
+// const MAX_DEPTH: i32 = 10;
 const MAX_DEPTH: i32 = 10;
+// const MAX_NODES: i32 = 1000;
 const MAX_NODES: i32 = 1000;
 
 #[derive(Debug)]
@@ -75,13 +79,14 @@ impl std::error::Error for CrawlerError {}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let url = "https://rust-lang.org/";
+    let url = "https://wikipedia.org/";
     let selector = scraper::Selector::parse("a:not([href^=\"#\"])").unwrap();
 
     let mut db = Db {
         nodes: Nodes::new(),
         links: Links::new(),
         host_names: HashSet::new(),
+        freq_table: HashMap::new(),
     };
     db.nodes.insert(Node {
         url: url.to_string(),
@@ -207,12 +212,24 @@ async fn crawl_bfs(
             return Ok(());
         }
 
-        let webpage = reqwest::get(url.as_str()).await.unwrap();
+        let webpage = match reqwest::get(url.as_str()).await {
+            Ok(w) => w,
+            Err(_) => {
+                continue;
+            }
+        };
+
         let text = webpage.text().await.unwrap_or(String::from(""));
-
         let doc = scraper::Html::parse_document(&text);
+        let selection = doc.select(selector);
+        let freq = selection.size_hint().1.unwrap_or(0) as i32;
+        db.freq_table.insert(
+            url.to_string(),
+            if freq <= MAX_NODES { freq } else { MAX_NODES },
+        );
+        // println!("{} {:?}", url, selection.size_hint().1.unwrap_or(0));
 
-        for el in doc.select(selector) {
+        for el in selection {
             if db.nodes.len() >= MAX_NODES as usize {
                 return Ok(());
             }
@@ -250,7 +267,7 @@ async fn crawl_bfs(
                 continue;
             }
 
-            if raw_url.starts_with("/") {
+            if db.host_names.contains(raw_url) {
                 queue.push_back((next_url, depth + 1, group_num));
             } else {
                 queue.push_back((next_url, depth + 1, group_num + 1));
